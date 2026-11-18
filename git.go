@@ -256,19 +256,66 @@ var typeCodes = map[string]int{"commit": 1, "tree": 2, "blob": 3, "tag": 4}
 
 // inflateAt inflates the zlib stream at offset, returning its bytes and the
 // stream's byte length. A counting reader gives the consumed length in one pass.
-func inflateAt(buf []byte, offset int) ([]byte, int, error) {
+//
+// The zlib reader is pooled: creating one allocates a ~32 KB decompression
+// window, and a push inflates three objects, so a fresh reader per object
+// costs ~96 KB of garbage per push (measured 126 KB/op for readPack). A
+// pooled reader is Reset to the next stream and reuses its window. The
+// output buffer is pre-grown from the pack header's size, so the output is
+// one allocation instead of ReadAll's grow-by-doubling sequence.
+// emptyZlibStream is the 8-byte zlib stream for empty input (CMF/FLG,
+// empty stored block, Adler-32 of nothing). It seeds the reader pool so
+// New always hands out a usable reader.
+var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
+
+var zlibReaderPool = sync.Pool{
+	New: func() any {
+		zr, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+		if err != nil {
+			return nil
+		}
+		return zr
+	},
+}
+
+func inflateAt(buf []byte, offset int, wantSize int) ([]byte, int, error) {
 	br := bytes.NewReader(buf[offset:])
-	zr, err := zlib.NewReader(br)
-	if err != nil {
-		return nil, 0, err
+	raw, _ := zlibReaderPool.Get().(io.ReadCloser)
+	var zr io.ReadCloser
+	if raw != nil {
+		zr = raw
+		// zlib.Resetter is Reset(io.Reader, []byte): the one-argument
+		// shape does not exist, so assert the real interface. Reset keeps
+		// the flate window; a *bytes.Reader also satisfies flate.Reader,
+		// so no bufio wrapper is allocated.
+		if res, ok := zr.(zlib.Resetter); ok {
+			if err := res.Reset(br, nil); err != nil {
+				zlibReaderPool.Put(zr)
+				return nil, 0, err
+			}
+		} else {
+			zlibReaderPool.Put(zr)
+			var err error
+			zr, err = zlib.NewReader(br)
+			if err != nil {
+				return nil, 0, err
+			}
+		}
+	} else {
+		var err error
+		zr, err = zlib.NewReader(br)
+		if err != nil {
+			return nil, 0, err
+		}
 	}
-	data, err := io.ReadAll(zr)
-	zr.Close()
-	if err != nil {
+	defer zlibReaderPool.Put(zr)
+	var out bytes.Buffer
+	out.Grow(wantSize)
+	if _, err := out.ReadFrom(zr); err != nil {
 		return nil, 0, err
 	}
 	consumed := len(buf[offset:]) - br.Len()
-	return data, consumed, nil
+	return out.Bytes(), consumed, nil
 }
 
 // readPack parses a pack v2 buffer into objects keyed by id. It verifies the
@@ -353,7 +400,7 @@ func readPack(buf []byte, resolveBase func(oid string) *gitObject) (map[string]*
 		} else if packTypes[typeCode] == "" {
 			return nil, fmt.Errorf("pack object has unknown type code %d", typeCode)
 		}
-		data, streamLen, err := inflateAt(buf, offset)
+		data, streamLen, err := inflateAt(buf, offset, size)
 		if err != nil {
 			return nil, err
 		}
@@ -363,6 +410,24 @@ func readPack(buf []byte, resolveBase func(oid string) *gitObject) (map[string]*
 		offset += streamLen
 		entry.data = data
 		raw = append(raw, entry)
+	}
+	// Fast path: no deltas (the timed push workload sends plain objects).
+	// Skip the byOffset/byOid/seen maps entirely and compute each object
+	// ID exactly once.
+	hasDelta := false
+	for i := range raw {
+		if raw[i].typeCode == 6 || raw[i].typeCode == 7 {
+			hasDelta = true
+			break
+		}
+	}
+	objects := make(map[string]*gitObject, len(raw))
+	if !hasDelta {
+		for i := range raw {
+			typ := packTypes[raw[i].typeCode]
+			objects[objectID(typ, raw[i].data)] = &gitObject{typ: typ, data: raw[i].data}
+		}
+		return objects, nil
 	}
 	// Resolve deltas. OFS entries reference earlier entries only; REF may need the store.
 	byOffset := make(map[int]string, len(raw))
@@ -430,13 +495,14 @@ func readPack(buf []byte, resolveBase func(oid string) *gitObject) (map[string]*
 		byOid[oid] = entry.offset
 		return &gitObject{typ: base.typ, data: data}, nil
 	}
-	objects := make(map[string]*gitObject, len(raw))
 	for i := range raw {
 		obj, err := resolve(&raw[i], make(map[int]bool))
 		if err != nil {
 			return nil, err
 		}
-		objects[objectID(obj.typ, obj.data)] = obj
+		// The ID was already computed inside resolve; reuse it instead of
+		// hashing the object a second time.
+		objects[byOffset[raw[i].offset]] = obj
 	}
 	return objects, nil
 }
@@ -673,10 +739,141 @@ type fetchSelection struct {
 	unshallow []string
 }
 
+// collectTreeObjectsInto adds treeOid and every object reachable from it
+// (subtrees and blobs) into the set. The tree itself is included.
+func collectTreeObjectsInto(store map[string]*gitObject, treeOid string, into map[string]bool) {
+	stack := []string{treeOid}
+	for len(stack) > 0 {
+		oid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if into[oid] {
+			continue
+		}
+		obj, ok := store[oid]
+		if !ok {
+			continue
+		}
+		into[oid] = true
+		if obj.typ == "tree" {
+			entries, err := parseTree(obj.data)
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				stack = append(stack, entry.oid)
+			}
+		}
+	}
+}
+
+// assembleFetchSelection builds the wire order (blobs/trees, then tags, then
+// commits) from the sent sets. Tree objects come from each sent commit's
+// tree, minus the excluded set.
+func assembleFetchSelection(store map[string]*gitObject, sentTags, sentCommits map[string]bool, directObjects map[string]*gitObject, excludedTreeObjects map[string]bool, tagTargets []string, shallowOut, unshallowOut []string) fetchSelection {
+	send := make(map[string]*gitObject)
+	for oid := range sentTags {
+		if obj, ok := store[oid]; ok {
+			send[oid] = obj
+		}
+	}
+	for oid, obj := range directObjects {
+		send[oid] = obj
+	}
+	for oid := range sentCommits {
+		obj, ok := store[oid]
+		if !ok {
+			continue
+		}
+		send[oid] = obj
+		treeObjects := make(map[string]bool)
+		collectTreeObjectsInto(store, parseCommit(obj.data).tree, treeObjects)
+		for treeOid := range treeObjects {
+			if excludedTreeObjects[treeOid] {
+				continue
+			}
+			if treeObj, ok := store[treeOid]; ok {
+				send[treeOid] = treeObj
+			}
+		}
+	}
+	// Tag targets that are trees/blobs (non-commit): send them too.
+	for _, target := range tagTargets {
+		obj, ok := store[target]
+		if ok && obj.typ != "commit" && !excludedTreeObjects[target] {
+			send[target] = obj
+		}
+	}
+
+	// Dependency-safe order: blobs/trees first, then tags, then commits.
+	rank := func(typ string) int {
+		switch typ {
+		case "blob":
+			return 0
+		case "tree":
+			return 1
+		case "tag":
+			return 2
+		default:
+			return 3
+		}
+	}
+	objects := make([]*gitObject, 0, len(send))
+	for _, obj := range send {
+		objects = append(objects, obj)
+	}
+	sort.SliceStable(objects, func(i, j int) bool {
+		return rank(objects[i].typ) < rank(objects[j].typ)
+	})
+	return fetchSelection{objects: objects, shallow: shallowOut, unshallow: unshallowOut}
+}
+
 // selectFetchObjects selects the objects a fetch sends, exactly as the suite's
 // fetch checks require: reachable(wants) - reachable(haves), with a depth limit
 // and shallow boundaries.
 func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBoundaries []string, depth *int) fetchSelection {
+	// Fast path: depth-1 fetch with no haves and no shallow boundaries — the
+	// timed clone workload. Every wanted commit is sent with its tree
+	// objects; parents sit exactly at the depth limit, so they are never
+	// sent, but a wanted commit with parents becomes a shallow boundary.
+	// This reproduces the generic algorithm's result for this input shape
+	// exactly (same sent sets, same shallow list, same rank order) without
+	// its maps, queue, or per-commit tree walks.
+	if depth != nil && *depth == 1 && len(haves) == 0 && len(shallowBoundaries) == 0 {
+		sentTags := make(map[string]bool)
+		sentCommits := make(map[string]bool)
+		directObjects := make(map[string]*gitObject)
+		var tagTargets []string
+		var shallowOut []string
+		addCommit := func(oid string) {
+			obj, ok := store[oid]
+			if !ok || obj.typ != "commit" || sentCommits[oid] {
+				return
+			}
+			sentCommits[oid] = true
+			commit := parseCommit(obj.data)
+			if len(commit.parents) > 0 {
+				shallowOut = append(shallowOut, oid)
+			}
+		}
+		for _, want := range wants {
+			obj, ok := store[want]
+			if !ok {
+				continue
+			}
+			switch obj.typ {
+			case "tag":
+				sentTags[want] = true
+				target := parseTag(obj.data).object
+				tagTargets = append(tagTargets, target)
+				addCommit(target)
+			case "commit":
+				addCommit(want)
+			default:
+				directObjects[want] = obj
+			}
+		}
+		return assembleFetchSelection(store, sentTags, sentCommits, directObjects, nil, tagTargets, shallowOut, nil)
+	}
 	haveSet := make(map[string]bool, len(haves))
 	for _, h := range haves {
 		haveSet[h] = true
@@ -779,96 +976,18 @@ func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBounda
 	// Trees/blobs: everything reachable from sent commits' trees, minus anything
 	// reachable from a have-commit's tree.
 	excludedTreeObjects := make(map[string]bool)
-	collectTreeObjects := func(treeOid string, into map[string]bool) {
-		stack := []string{treeOid}
-		for len(stack) > 0 {
-			oid := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			if into[oid] {
-				continue
-			}
-			obj, ok := store[oid]
-			if !ok {
-				continue
-			}
-			into[oid] = true
-			if obj.typ == "tree" {
-				entries, err := parseTree(obj.data)
-				if err != nil {
-					continue
-				}
-				for _, entry := range entries {
-					stack = append(stack, entry.oid)
-				}
-			}
-		}
-	}
 	for _, have := range haves {
 		obj, ok := store[have]
 		if !ok {
 			continue
 		}
 		if obj.typ == "commit" {
-			collectTreeObjects(parseCommit(obj.data).tree, excludedTreeObjects)
+			collectTreeObjectsInto(store, parseCommit(obj.data).tree, excludedTreeObjects)
 		} else if obj.typ == "tree" {
-			collectTreeObjects(have, excludedTreeObjects)
+			collectTreeObjectsInto(store, have, excludedTreeObjects)
 		}
 	}
-	send := make(map[string]*gitObject)
-	for oid := range sentTags {
-		if obj, ok := store[oid]; ok {
-			send[oid] = obj
-		}
-	}
-	for oid, obj := range directObjects {
-		send[oid] = obj
-	}
-	for oid := range sentCommits {
-		obj, ok := store[oid]
-		if !ok {
-			continue
-		}
-		send[oid] = obj
-		treeObjects := make(map[string]bool)
-		collectTreeObjects(parseCommit(obj.data).tree, treeObjects)
-		for treeOid := range treeObjects {
-			if excludedTreeObjects[treeOid] {
-				continue
-			}
-			if treeObj, ok := store[treeOid]; ok {
-				send[treeOid] = treeObj
-			}
-		}
-	}
-	// Tag targets that are trees/blobs (non-commit): send them too.
-	for _, target := range tagTargets {
-		obj, ok := store[target]
-		if ok && obj.typ != "commit" && !excludedTreeObjects[target] {
-			send[target] = obj
-		}
-	}
-
-	// Dependency-safe order: blobs/trees first, then tags, then commits.
-	rank := func(typ string) int {
-		switch typ {
-		case "blob":
-			return 0
-		case "tree":
-			return 1
-		case "tag":
-			return 2
-		default:
-			return 3
-		}
-	}
-	objects := make([]*gitObject, 0, len(send))
-	for _, obj := range send {
-		objects = append(objects, obj)
-	}
-	sort.SliceStable(objects, func(i, j int) bool {
-		return rank(objects[i].typ) < rank(objects[j].typ)
-	})
-	return fetchSelection{objects: objects, shallow: shallowOut, unshallow: unshallowOut}
+	return assembleFetchSelection(store, sentTags, sentCommits, directObjects, excludedTreeObjects, tagTargets, shallowOut, unshallowOut)
 }
 
 // reachableIDs returns all object ids reachable from tips.

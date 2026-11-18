@@ -30,7 +30,14 @@ type request struct {
 	host        string
 	query       url.Values
 	body        []byte
+	auth        string
 	gitProtocol string
+	// rawStatus is set by the raw transport when the request itself is
+	// unusable (413: body over the cap). serveRequest answers it directly.
+	rawStatus int
+	// segments is the decoded path split, computed once in route() and
+	// reused by the REST router (it used to re-split the same path).
+	segments []string
 }
 
 // response is what a handler returns; the server writes it out.
@@ -79,6 +86,9 @@ func authorized(authHeader string) bool {
 }
 
 // splitTarget splits a request target into its %-encoded path and query.
+// No query string (the timed read/write/push/clone requests) returns a nil
+// query: ParseQuery on "" still allocates a map, and every reader here is
+// nil-safe (Get on a nil map returns "", ranging a nil map is empty).
 func splitTarget(target string) (string, url.Values) {
 	rawPath := target
 	rawQuery := ""
@@ -88,6 +98,9 @@ func splitTarget(target string) (string, url.Values) {
 	}
 	if rawPath == "" {
 		rawPath = "/"
+	}
+	if rawQuery == "" {
+		return rawPath, nil
 	}
 	query, _ := url.ParseQuery(rawQuery)
 	return rawPath, query
@@ -123,6 +136,7 @@ func route(s *Store, req *request) response {
 			segments = append(segments, decodeSegment(part))
 		}
 	}
+	req.segments = segments
 	if len(segments) >= 3 && strings.HasSuffix(segments[1], ".git") &&
 		(segments[2] == "info" || segments[2] == "git-upload-pack" || segments[2] == "git-receive-pack") {
 		owner := segments[0]
@@ -151,47 +165,66 @@ func route(s *Store, req *request) response {
 	return jsonMsg(404, "Not Found")
 }
 
-// handler is the http.Handler for the whole forge.
+// withRequestID stamps a response with a fresh X-GitHub-Request-Id, as
+// every reply carries one.
+func withRequestID(resp response) response {
+	id := requestCounter.Add(1)
+	value := "req-" + strconv.FormatInt(id, 10)
+	if resp.headers == nil {
+		resp.headers = map[string]string{"x-github-request-id": value}
+	} else {
+		resp.headers["x-github-request-id"] = value
+	}
+	return resp
+}
+
+// serveRequest is the transport-independent core: the response for one parsed
+// request. Both the net/http handler and the raw HTTP/1.1 transport call it,
+// so their behavior is identical. It recovers from handler panics (500) and
+// stamps the request id on every reply.
+func serveRequest(s *Store, req *request) (resp response) {
+	// The deferred stamp runs on every exit — including a recovered panic —
+	// so the 500 also carries the request id, as before.
+	defer func() {
+		if rec := recover(); rec != nil {
+			resp = jsonMsg(500, "Internal Server Error")
+		}
+		resp = withRequestID(resp)
+	}()
+
+	// The env's boot check calls this twice: 200 {"ok":true}. No auth.
+	if req.rawStatus == 413 {
+		resp = jsonMsg(413, "request body too large")
+	} else if req.method == "GET" && req.path == "/healthz" {
+		resp = jsonBytes(200, []byte(`{"ok":true}`))
+	} else if !authorized(req.auth) {
+		resp = jsonMsg(401, "Bad credentials")
+	} else {
+		resp = route(s, req)
+	}
+	return resp
+}
+
+// handler is the http.Handler for the whole forge (kept as the fallback
+// transport; main uses the raw HTTP/1.1 server).
 type handler struct {
 	store *Store
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Recover from a handler panic so one bad request never takes the server down.
-	defer func() {
-		if rec := recover(); rec != nil {
-			resp := jsonMsg(500, "Internal Server Error")
-			writeResponse(w, resp)
-		}
-	}()
-
-	id := requestCounter.Add(1)
-	w.Header().Set("x-github-request-id", "req-"+strconv.FormatInt(id, 10))
-
 	rawPath, query := splitTarget(r.RequestURI)
 	method := r.Method
-
-	// The env's boot check calls this twice: 200 {"ok":true}. No auth.
-	if method == "GET" && rawPath == "/healthz" {
-		writeResponse(w, jsonBytes(200, []byte(`{"ok":true}`)))
-		return
-	}
-
-	if !authorized(r.Header.Get("Authorization")) {
-		writeResponse(w, jsonMsg(401, "Bad credentials"))
-		return
-	}
 
 	// Read the request body fully (up to the cap); empty for GET/HEAD.
 	var body []byte
 	if method != "GET" && method != "HEAD" {
 		data, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 		if err != nil {
-			writeResponse(w, jsonMsg(500, "Internal Server Error"))
+			writeResponse(w, withRequestID(jsonMsg(500, "Internal Server Error")))
 			return
 		}
 		if len(data) > maxBodyBytes {
-			writeResponse(w, jsonMsg(413, "request body too large"))
+			writeResponse(w, withRequestID(jsonMsg(413, "request body too large")))
 			return
 		}
 		body = data
@@ -203,9 +236,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		host:        r.Host,
 		query:       query,
 		body:        body,
+		auth:        r.Header.Get("Authorization"),
 		gitProtocol: r.Header.Get("Git-Protocol"),
 	}
-	writeResponse(w, route(h.store, req))
+	writeResponse(w, serveRequest(h.store, req))
 }
 
 func writeResponse(w http.ResponseWriter, resp response) {

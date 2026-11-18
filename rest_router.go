@@ -24,10 +24,15 @@ func handleRest(s *Store, req *request) response {
 
 func handleRestLocked(s *Store, req *request) response {
 	query := req.query
-	segments := []string{}
-	for _, part := range strings.Split(req.path, "/") {
-		if part != "" {
-			segments = append(segments, decodeSegment(part))
+	// Reuse the segments route() computed; fall back to splitting here if
+	// this handler is ever called without them.
+	segments := req.segments
+	if segments == nil {
+		segments = []string{}
+		for _, part := range strings.Split(req.path, "/") {
+			if part != "" {
+				segments = append(segments, decodeSegment(part))
+			}
 		}
 	}
 	// Drop 'api' and 'v3'.
@@ -644,6 +649,20 @@ func handleRestLocked(s *Store, req *request) response {
 				return jsonBytes(200, w.bytes())
 			}
 			if len(rest) == 1 && method == "POST" {
+				// Fast path: exact-shape decode (falls back below on any
+				// deviation, so statuses and messages are unchanged).
+				if title, bodyText, labelNames, fastOK := parseIssueCreate(req.body); fastOK {
+					if title == "" {
+						return jsonMsg(422, "title is required")
+					}
+					for _, labelName := range labelNames {
+						if _, ok := r.labels[labelName]; !ok {
+							return jsonMsg(422, "Label '"+labelName+"' does not exist")
+						}
+					}
+					iss := s.createIssue(r, title, bodyText, labelNames)
+					return jsonBytes(201, issueJSONBytes(r, iss, nil))
+				}
 				parsed, ok := parseJSONBody(req.body)
 				if !ok {
 					return jsonMsg(400, "malformed JSON body")
@@ -937,8 +956,12 @@ func handleRestLocked(s *Store, req *request) response {
 	return jsonMsg(404, "Not Found")
 }
 
-// decodeSegment mirrors decodeURIComponent with a raw fallback.
+// decodeSegment mirrors decodeURIComponent with a raw fallback. Segments
+// without a '%' are returned as-is: PathUnescape would copy them anyway.
 func decodeSegment(part string) string {
+	if !strings.Contains(part, "%") {
+		return part
+	}
 	decoded, err := url.PathUnescape(part)
 	if err != nil {
 		return part

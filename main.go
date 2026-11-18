@@ -5,21 +5,16 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
-	"time"
 )
 
 func main() {
 	store := newStore()
-	server := &http.Server{
-		Handler: &handler{store: store},
-	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[entry] listen: %v\n", err)
@@ -37,12 +32,12 @@ func main() {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-stop
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(ctx)
+		listener.Close()
 	}()
 
-	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+	// Raw HTTP/1.1 transport (rawhttp.go): same handlers as the net/http
+	// fallback, without its per-request overhead.
+	if err := serveRaw(store, listener); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		fmt.Fprintf(os.Stderr, "[entry] serve: %v\n", err)
 		os.Exit(1)
 	}

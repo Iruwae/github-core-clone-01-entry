@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------- JSON writer
@@ -29,7 +30,35 @@ type jw struct {
 
 func (w *jw) raw(s string)      { w.buf = append(w.buf, s...) }
 func (w *jw) byte(c byte)       { w.buf = append(w.buf, c) }
-func (w *jw) str(s string)      { b, _ := json.Marshal(s); w.buf = append(w.buf, b...) }
+// str appends s as a JSON string. Fast path: when s is valid UTF-8 and
+// contains no byte json.Marshal would escape, the quoted string is appended
+// directly — byte-identical to Marshal's output, without its allocation.
+// Marshal escapes <, >, & (HTML), control bytes, '"' and '\', and U+2028/29;
+// anything else falls back to Marshal.
+func (w *jw) str(s string) {
+	if utf8.ValidString(s) && jsonSafeString(s) {
+		w.byte('"')
+		w.raw(s)
+		w.byte('"')
+		return
+	}
+	b, _ := json.Marshal(s)
+	w.buf = append(w.buf, b...)
+}
+
+// jsonSafeString reports whether s contains no byte json.Marshal would escape.
+func jsonSafeString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+		if c == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			return false // U+2028/U+2029
+		}
+	}
+	return true
+}
 func (w *jw) integer(n int)     { w.buf = strconv.AppendInt(w.buf, int64(n), 10) }
 func (w *jw) boolean(b bool)    { if b { w.buf = append(w.buf, "true"...); } else { w.buf = append(w.buf, "false"...); } }
 func (w *jw) null()             { w.buf = append(w.buf, "null"...)}
@@ -54,6 +83,61 @@ func parseJSONBody(body []byte) (any, bool) {
 		return nil, false
 	}
 	return value, true
+}
+
+// parseIssueCreate decodes an issue-create body without the map[string]any
+// boxing of parseJSONBody: keys are exact-case (like the map path) and each
+// value is decoded from its raw JSON. It returns ok=false for any shape it
+// cannot represent exactly, and the caller falls back to parseJSONBody, so
+// every status code and message stays identical to the generic path.
+// A null top-level body is also a fallback (the generic path answers 422
+// "Validation Failed", not 422 "title is required").
+func parseIssueCreate(body []byte) (title, bodyText string, labels []string, ok bool) {
+	var rec map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rec); err != nil || rec == nil {
+		return "", "", nil, false
+	}
+	if raw, present := rec["title"]; present {
+		var t string
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return "", "", nil, false
+		}
+		title = t
+	}
+	if raw, present := rec["body"]; present {
+		var b string
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return "", "", nil, false
+		}
+		bodyText = b
+	}
+	if raw, present := rec["labels"]; present {
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return "", "", nil, false
+		}
+		for _, item := range items {
+			if len(item) == 0 || item[0] == 'n' { // null: skipped, as in the generic path
+				continue
+			}
+			var s string
+			if err := json.Unmarshal(item, &s); err == nil {
+				labels = append(labels, s)
+				continue
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(item, &obj); err == nil {
+				if nameRaw, hasName := obj["name"]; hasName {
+					var n string
+					if err := json.Unmarshal(nameRaw, &n); err == nil {
+						labels = append(labels, n)
+					}
+				}
+			}
+			// Numbers, booleans and arrays are skipped, as in the generic path.
+		}
+	}
+	return title, bodyText, labels, true
 }
 
 func isRecord(value any) bool {
