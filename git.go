@@ -788,7 +788,7 @@ func collectTreeObjectsInto(store map[string]*gitObject, treeOid string, into ma
 		}
 		into[oid] = true
 		if obj.typ == "tree" {
-			entries, err := parseTree(obj.data)
+			entries, err := treeOf(obj)
 			if err != nil {
 				continue
 			}
@@ -883,7 +883,7 @@ func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBounda
 				return
 			}
 			sentCommits[oid] = true
-			commit := parseCommit(obj.data)
+			commit := commitOf(obj)
 			if len(commit.parents) > 0 {
 				shallowOut = append(shallowOut, oid)
 			}
@@ -979,7 +979,7 @@ func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBounda
 			// Held and not a boundary: stop here, send nothing below.
 			continue
 		}
-		commit := parseCommit(obj.data)
+		commit := commitOf(obj)
 		if !isHave {
 			sentCommits[current.oid] = true
 			if limit >= 0 && current.depth == limit-1 && len(commit.parents) > 0 {

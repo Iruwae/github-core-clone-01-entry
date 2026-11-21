@@ -21,6 +21,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"bufio"
 	"io"
 	"net"
@@ -28,7 +29,6 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -196,47 +196,46 @@ func readRawRequest(br *bufio.Reader, bw *bufio.Writer) (*request, bool, bool) {
 
 // writeRawResponse writes one response. It returns false if the connection
 // is broken. HEAD carries Content-Length but no body, as net/http does.
-// The header block is built into a pre-sized builder; the request id rides
-// in its own field, so no header map or canonicalization is needed for it.
+// The header block is built into a stack buffer (no strings.Builder alloc);
+// the request id rides in its own field, so no header map or
+// canonicalization is needed for it.
 func writeRawResponse(bw *bufio.Writer, req *request, resp response, closeAfter bool) bool {
-	var sb strings.Builder
-	sb.Grow(256)
-	version := "HTTP/1.1"
-	sb.WriteString(version)
-	sb.WriteByte(' ')
-	sb.WriteString(strconv.Itoa(resp.status))
-	sb.WriteByte(' ')
-	sb.WriteString(rawReason(resp.status))
-	sb.WriteString("\r\n")
+	var hdr [512]byte
+	out := hdr[:0]
+	out = append(out, "HTTP/1.1 "...)
+	out = strconv.AppendInt(out, int64(resp.status), 10)
+	out = append(out, ' ')
+	out = append(out, rawReason(resp.status)...)
+	out = append(out, "\r\n"...)
 	if resp.contentType != "" {
-		sb.WriteString("Content-Type: ")
-		sb.WriteString(resp.contentType)
-		sb.WriteString("\r\n")
+		out = append(out, "Content-Type: "...)
+		out = append(out, resp.contentType...)
+		out = append(out, "\r\n"...)
 	}
 	if resp.body != nil {
-		sb.WriteString("Content-Length: ")
-		sb.WriteString(strconv.Itoa(len(resp.body)))
-		sb.WriteString("\r\n")
+		out = append(out, "Content-Length: "...)
+		out = strconv.AppendInt(out, int64(len(resp.body)), 10)
+		out = append(out, "\r\n"...)
 	}
-	sb.WriteString("Date: ")
-	sb.WriteString(rawDate())
-	sb.WriteString("\r\n")
+	out = append(out, "Date: "...)
+	out = append(out, rawDate()...)
+	out = append(out, "\r\n"...)
 	if resp.reqID != "" {
-		sb.WriteString("X-GitHub-Request-Id: ")
-		sb.WriteString(resp.reqID)
-		sb.WriteString("\r\n")
+		out = append(out, "X-GitHub-Request-Id: "...)
+		out = append(out, resp.reqID...)
+		out = append(out, "\r\n"...)
 	}
 	for name, value := range resp.headers {
-		sb.WriteString(textproto.CanonicalMIMEHeaderKey(name))
-		sb.WriteString(": ")
-		sb.WriteString(value)
-		sb.WriteString("\r\n")
+		out = append(out, textproto.CanonicalMIMEHeaderKey(name)...)
+		out = append(out, ": "...)
+		out = append(out, value...)
+		out = append(out, "\r\n"...)
 	}
 	if closeAfter {
-		sb.WriteString("Connection: close\r\n")
+		out = append(out, "Connection: close\r\n"...)
 	}
-	sb.WriteString("\r\n")
-	if _, err := bw.WriteString(sb.String()); err != nil {
+	out = append(out, "\r\n"...)
+	if _, err := bw.Write(out); err != nil {
 		return false
 	}
 	if req.method != "HEAD" && len(resp.body) > 0 {
@@ -305,20 +304,21 @@ func rawReason(status int) string {
 }
 
 // rawDate returns the current Date header value, cached per second like
-// net/http's.
-var rawDateCache struct {
-	mu   sync.Mutex
+// net/http's. Lock-free: the cached (second, text) pair is swapped via a
+// single atomic pointer, so concurrent requests never serialize on a mutex.
+type rawDateEntry struct {
 	sec  int64
 	text string
 }
 
+var rawDateCache atomic.Pointer[rawDateEntry]
+
 func rawDate() string {
 	now := time.Now().Unix()
-	rawDateCache.mu.Lock()
-	defer rawDateCache.mu.Unlock()
-	if rawDateCache.sec != now {
-		rawDateCache.sec = now
-		rawDateCache.text = time.Unix(now, 0).UTC().Format(http.TimeFormat)
+	if ent := rawDateCache.Load(); ent != nil && ent.sec == now {
+		return ent.text
 	}
-	return rawDateCache.text
+	text := time.Unix(now, 0).UTC().Format(http.TimeFormat)
+	rawDateCache.Store(&rawDateEntry{sec: now, text: text})
+	return text
 }
