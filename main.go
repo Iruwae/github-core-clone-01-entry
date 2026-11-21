@@ -9,11 +9,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 )
 
 func main() {
+	// The forge is a short-lived benchmark server with a small live set
+	// (one in-memory store, a few MB); collecting four times less often
+	// trades a little heap for measurably less GC CPU on the timed paths.
+	debug.SetGCPercent(400)
 	store := newStore()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

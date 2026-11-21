@@ -297,18 +297,46 @@ func labelJSON(r *repo, name string) []byte {
 
 // issueJSONBytes serializes one issue. With asPull nil it reuses the cached
 // bytes until the issue mutates (the read workload's 2,000 GETs of one issue
-// are the same bytes every time).
+// are the same bytes every time). The cache holds the wire form (with the
+// trailing newline); this returns it without the newline for callers that
+// embed the JSON inside a larger document.
 func issueJSONBytes(r *repo, iss *issue, asPull *pull) []byte {
+	if asPull == nil {
+		if cached := iss.cache.Load(); cached != nil {
+			return cached.b[:len(cached.b)-1]
+		}
+	}
+	built, _ := buildIssueJSONCached(r, iss, asPull)
+	return built
+}
+
+// issueJSONWire is the hot-path form for a whole-body reply: the cached wire
+// bytes (with trailing newline) reused verbatim, no copy, no rebuild.
+func issueJSONWire(r *repo, iss *issue, asPull *pull) []byte {
 	if asPull == nil {
 		if cached := iss.cache.Load(); cached != nil {
 			return cached.b
 		}
 	}
-	built := buildIssueJSON(r, iss, asPull)
+	_, wire := buildIssueJSONCached(r, iss, asPull)
+	return wire
+}
+
+// buildIssueJSONCached builds one issue's JSON once and, for a plain issue,
+// stores the wire form (built bytes + trailing newline) in the cache. It
+// returns the built bytes (no newline) and the wire bytes (with newline);
+// for a pull-request view there is no cache and the wire form is the built
+// bytes plus a newline appended in place (fresh buffer, single owner).
+func buildIssueJSONCached(r *repo, iss *issue, asPull *pull) (built, wire []byte) {
+	built = buildIssueJSON(r, iss, asPull)
 	if asPull == nil {
-		iss.cache.Store(&issueCache{b: built})
+		wire = make([]byte, 0, len(built)+1)
+		wire = append(wire, built...)
+		wire = append(wire, '\n')
+		iss.cache.Store(&issueCache{b: wire})
+		return built, wire
 	}
-	return built
+	return built, append(built, '\n')
 }
 
 func buildIssueJSON(r *repo, iss *issue, asPull *pull) []byte {

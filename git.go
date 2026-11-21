@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const zeroOID = "0000000000000000000000000000000000000000"
@@ -30,6 +31,38 @@ const zeroOID = "0000000000000000000000000000000000000000"
 type gitObject struct {
 	typ  string // 'commit' | 'tree' | 'blob' | 'tag'
 	data []byte
+	// Parsed-commit / parsed-tree cache. Objects are immutable once stored,
+	// so a parsed form is valid forever; atomic so readers outside the
+	// store lock (pack generation runs lock-free) never race. A duplicate
+	// parse under concurrency just overwrites with the same value.
+	commit atomic.Pointer[commitInfo]
+	tree   atomic.Pointer[[]treeEntry]
+}
+
+// commitOf returns the parsed commit, cached on the object. Hot paths
+// (isAncestor per push, reachableIDs per clone) used to re-parse the same
+// commit text on every visit — O(depth) parses per push, O(commits) per
+// clone — so caching is the whole win here.
+func commitOf(obj *gitObject) commitInfo {
+	if c := obj.commit.Load(); c != nil {
+		return *c
+	}
+	c := parseCommit(obj.data)
+	obj.commit.Store(&c)
+	return c
+}
+
+// treeOf returns the parsed tree entries, cached on the object.
+func treeOf(obj *gitObject) ([]treeEntry, error) {
+	if t := obj.tree.Load(); t != nil {
+		return *t, nil
+	}
+	entries, err := parseTree(obj.data)
+	if err != nil {
+		return nil, err
+	}
+	obj.tree.Store(&entries)
+	return entries, nil
 }
 
 func sha1Hex(data []byte) string {
@@ -340,7 +373,7 @@ func readPack(buf []byte, resolveBase func(oid string) *gitObject) (map[string]*
 	}
 	type rawEntry struct {
 		offset     int
-		typeCode    int
+		typeCode   int
 		data       []byte
 		baseOffset int
 		baseOid    string
@@ -786,7 +819,7 @@ func assembleFetchSelection(store map[string]*gitObject, sentTags, sentCommits m
 		}
 		send[oid] = obj
 		treeObjects := make(map[string]bool)
-		collectTreeObjectsInto(store, parseCommit(obj.data).tree, treeObjects)
+		collectTreeObjectsInto(store, commitOf(obj).tree, treeObjects)
 		for treeOid := range treeObjects {
 			if excludedTreeObjects[treeOid] {
 				continue
@@ -963,7 +996,7 @@ func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBounda
 	for _, boundary := range shallowBoundaries {
 		obj, ok := store[boundary]
 		if ok && obj.typ == "commit" {
-			parents := parseCommit(obj.data).parents
+			parents := commitOf(obj).parents
 			for _, parent := range parents {
 				if sentCommits[parent] {
 					unshallowOut = append(unshallowOut, boundary)
@@ -982,7 +1015,7 @@ func selectFetchObjects(store map[string]*gitObject, wants, haves, shallowBounda
 			continue
 		}
 		if obj.typ == "commit" {
-			collectTreeObjectsInto(store, parseCommit(obj.data).tree, excludedTreeObjects)
+			collectTreeObjectsInto(store, commitOf(obj).tree, excludedTreeObjects)
 		} else if obj.typ == "tree" {
 			collectTreeObjectsInto(store, have, excludedTreeObjects)
 		}
@@ -1007,11 +1040,11 @@ func reachableIDs(store map[string]*gitObject, tips []string) map[string]bool {
 		out[oid] = true
 		switch obj.typ {
 		case "commit":
-			commit := parseCommit(obj.data)
+			commit := commitOf(obj)
 			stack = append(stack, commit.tree)
 			stack = append(stack, commit.parents...)
 		case "tree":
-			entries, err := parseTree(obj.data)
+			entries, err := treeOf(obj)
 			if err != nil {
 				continue
 			}

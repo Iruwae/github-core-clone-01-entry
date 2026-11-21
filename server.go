@@ -41,20 +41,36 @@ type request struct {
 }
 
 // response is what a handler returns; the server writes it out.
+// reqID is the X-GitHub-Request-Id value, kept out of headers so stamping
+// it costs no map allocation (every reply carries one).
 type response struct {
 	status      int
 	contentType string
 	body        []byte
 	headers     map[string]string
+	reqID       string
 }
 
 // jsonBytes builds a JSON response: the body plus one trailing newline, as
-// the reference's sendJson does.
+// the reference's sendJson does. Serializers hand it a freshly built buffer,
+// so the newline is appended in place when the buffer has spare capacity
+// instead of copying the body (the shared cached bytes never reach here —
+// they use jsonBytesWire).
 func jsonBytes(status int, body []byte) response {
+	if cap(body) > len(body) {
+		body = append(body, '\n')
+		return response{status: status, contentType: "application/json; charset=utf-8", body: body}
+	}
 	out := make([]byte, 0, len(body)+1)
 	out = append(out, body...)
 	out = append(out, '\n')
 	return response{status: status, contentType: "application/json; charset=utf-8", body: out}
+}
+
+// jsonBytesWire builds a JSON response from bytes that already end with the
+// trailing newline (cached serializations), without copying.
+func jsonBytesWire(status int, body []byte) response {
+	return response{status: status, contentType: "application/json; charset=utf-8", body: body}
 }
 
 // bufResp builds a raw (non-JSON) response with the given content type.
@@ -166,15 +182,11 @@ func route(s *Store, req *request) response {
 }
 
 // withRequestID stamps a response with a fresh X-GitHub-Request-Id, as
-// every reply carries one.
+// every reply carries one. The id rides in its own field, not the headers
+// map, so stamping costs no allocation.
 func withRequestID(resp response) response {
 	id := requestCounter.Add(1)
-	value := "req-" + strconv.FormatInt(id, 10)
-	if resp.headers == nil {
-		resp.headers = map[string]string{"x-github-request-id": value}
-	} else {
-		resp.headers["x-github-request-id"] = value
-	}
+	resp.reqID = "req-" + strconv.FormatInt(id, 10)
 	return resp
 }
 
@@ -245,6 +257,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func writeResponse(w http.ResponseWriter, resp response) {
 	if resp.contentType != "" {
 		w.Header().Set("Content-Type", resp.contentType)
+	}
+	if resp.reqID != "" {
+		w.Header().Set("X-GitHub-Request-Id", resp.reqID)
 	}
 	for k, v := range resp.headers {
 		w.Header().Set(k, v)

@@ -661,7 +661,7 @@ func handleRestLocked(s *Store, req *request) response {
 						}
 					}
 					iss := s.createIssue(r, title, bodyText, labelNames)
-					return jsonBytes(201, issueJSONBytes(r, iss, nil))
+					return jsonBytesWire(201, issueJSONWire(r, iss, nil))
 				}
 				parsed, ok := parseJSONBody(req.body)
 				if !ok {
@@ -694,7 +694,7 @@ func handleRestLocked(s *Store, req *request) response {
 					}
 				}
 				iss := s.createIssue(r, title, bodyText, labelNames)
-				return jsonBytes(201, issueJSONBytes(r, iss, nil))
+				return jsonBytesWire(201, issueJSONWire(r, iss, nil))
 			}
 			if len(rest) == 2 {
 				number, err := strconv.Atoi(rest[1])
@@ -703,12 +703,12 @@ func handleRestLocked(s *Store, req *request) response {
 				}
 				if method == "GET" {
 					if iss := s.findIssue(r, number); iss != nil {
-						return jsonBytes(200, issueJSONBytes(r, iss, nil))
+						return jsonBytesWire(200, issueJSONWire(r, iss, nil))
 					}
 					if p := s.findPull(r, number); p != nil {
 						// A pull request read through the issues view.
 						pseudo := &issue{id: p.id, number: p.number, title: p.title, body: p.body, state: p.state}
-						return jsonBytes(200, issueJSONBytes(r, pseudo, p))
+						return jsonBytesWire(200, issueJSONWire(r, pseudo, p))
 					}
 					return jsonMsg(404, "Not Found")
 				}
@@ -739,7 +739,7 @@ func handleRestLocked(s *Store, req *request) response {
 							invalidateIssue(iss)
 						}
 					}
-					return jsonBytes(200, issueJSONBytes(r, iss, nil))
+					return jsonBytesWire(200, issueJSONWire(r, iss, nil))
 				}
 				return jsonMsg(404, "Not Found")
 			}

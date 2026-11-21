@@ -72,17 +72,28 @@ type rawHeader struct {
 // readRawRequest parses one request from br. It returns the request, whether
 // the connection must close after the reply, and whether parsing succeeded.
 // A 100-continue expectation is answered inline (bw) before the body is read.
+//
+// Hot path: header names are matched with EqualFold on the line's own bytes
+// (no ToLower copy per header) and the request line is split by index, so
+// parsing allocates nothing per header.
 func readRawRequest(br *bufio.Reader, bw *bufio.Writer) (*request, bool, bool) {
 	line, err := br.ReadString('\n')
 	if err != nil {
 		return nil, false, false
 	}
 	line = strings.TrimRight(line, "\r\n")
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	sp1 := strings.IndexByte(line, ' ')
+	sp2 := -1
+	if sp1 >= 0 {
+		rel := strings.IndexByte(line[sp1+1:], ' ')
+		if rel >= 0 {
+			sp2 = sp1 + 1 + rel
+		}
+	}
+	if sp1 < 0 || sp2 < 0 {
 		return nil, false, false
 	}
-	method, target, version := parts[0], parts[1], parts[2]
+	method, target, version := line[:sp1], line[sp1+1:sp2], line[sp2+1:]
 	if version != "HTTP/1.1" && version != "HTTP/1.0" {
 		return nil, false, false
 	}
@@ -103,31 +114,31 @@ func readRawRequest(br *bufio.Reader, bw *bufio.Writer) (*request, bool, bool) {
 		if colon < 0 {
 			return nil, false, false
 		}
-		name := strings.ToLower(strings.TrimSpace(hdr[:colon]))
+		name := strings.TrimSpace(hdr[:colon])
 		value := strings.TrimSpace(hdr[colon+1:])
-		switch name {
-		case "authorization":
+		switch {
+		case strings.EqualFold(name, "authorization"):
 			auth = value
-		case "git-protocol":
+		case strings.EqualFold(name, "git-protocol"):
 			gitProtocol = value
-		case "host":
+		case strings.EqualFold(name, "host"):
 			host = value
-		case "content-length":
+		case strings.EqualFold(name, "content-length"):
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 0 {
 				return nil, false, false
 			}
 			contentLength = n
-		case "connection":
-			if strings.Contains(strings.ToLower(value), "close") {
+		case strings.EqualFold(name, "connection"):
+			if containsFold(value, "close") {
 				connectionClose = true
 			}
-		case "transfer-encoding":
-			if strings.Contains(strings.ToLower(value), "chunked") {
+		case strings.EqualFold(name, "transfer-encoding"):
+			if containsFold(value, "chunked") {
 				chunked = true
 			}
-		case "expect":
-			if strings.Contains(strings.ToLower(value), "100-continue") {
+		case strings.EqualFold(name, "expect"):
+			if containsFold(value, "100-continue") {
 				expectContinue = true
 			}
 		}
@@ -185,8 +196,11 @@ func readRawRequest(br *bufio.Reader, bw *bufio.Writer) (*request, bool, bool) {
 
 // writeRawResponse writes one response. It returns false if the connection
 // is broken. HEAD carries Content-Length but no body, as net/http does.
+// The header block is built into a pre-sized builder; the request id rides
+// in its own field, so no header map or canonicalization is needed for it.
 func writeRawResponse(bw *bufio.Writer, req *request, resp response, closeAfter bool) bool {
 	var sb strings.Builder
+	sb.Grow(256)
 	version := "HTTP/1.1"
 	sb.WriteString(version)
 	sb.WriteByte(' ')
@@ -207,6 +221,11 @@ func writeRawResponse(bw *bufio.Writer, req *request, resp response, closeAfter 
 	sb.WriteString("Date: ")
 	sb.WriteString(rawDate())
 	sb.WriteString("\r\n")
+	if resp.reqID != "" {
+		sb.WriteString("X-GitHub-Request-Id: ")
+		sb.WriteString(resp.reqID)
+		sb.WriteString("\r\n")
+	}
 	for name, value := range resp.headers {
 		sb.WriteString(textproto.CanonicalMIMEHeaderKey(name))
 		sb.WriteString(": ")
@@ -229,6 +248,37 @@ func writeRawResponse(bw *bufio.Writer, req *request, resp response, closeAfter 
 }
 
 // rawReason maps the statuses the forge returns to their reason phrases.
+// containsFold reports whether s contains needle, case-insensitively,
+// without allocating (no ToLower copy of the value).
+func containsFold(s, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	if len(needle) > len(s) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			a, b := s[i+j], needle[j]
+			if a >= 'A' && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 func rawReason(status int) string {
 	switch status {
 	case 200:

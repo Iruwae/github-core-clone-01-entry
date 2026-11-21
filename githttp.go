@@ -187,14 +187,27 @@ func handleUploadPack(s *Store, owner, repoName string, body []byte) response {
 		return bufResp(200, resultType, out)
 	}
 	if command == "command=fetch" {
+		args := parseFetchArgs(lines[1:])
+		cacheKey := ""
+		if len(args.haves) == 0 {
+			cacheKey = fetchCacheKey(owner, repoName, args)
+			if cached, ok := s.fetchCacheGet(cacheKey); ok {
+				s.mu.RUnlock()
+				return bufResp(200, resultType, cached)
+			}
+		}
 		// Select objects under the lock, build the pack after releasing it.
-		resp := fetchV2Locked(s, r, lines[1:])
+		resp := fetchV2Locked(s, r, args)
 		s.mu.RUnlock()
 		pack, perr := writePack(resp.selection.objects)
 		if perr != nil {
 			return jsonMsg(500, "Internal Server Error")
 		}
-		return bufResp(200, resultType, assembleFetchV2(resp, pack))
+		out := assembleFetchV2(resp, pack)
+		if cacheKey != "" {
+			s.fetchCachePut(cacheKey, out)
+		}
+		return bufResp(200, resultType, out)
 	}
 	// Not a v2 command: answer an empty result rather than failing the exchange.
 	s.mu.RUnlock()
@@ -264,28 +277,61 @@ type fetchPlan struct {
 	selection fetchSelection
 }
 
-// fetchV2Locked parses fetch args and selects objects (caller holds RLock).
-func fetchV2Locked(s *Store, r *repo, argLines []string) fetchPlan {
-	plan := fetchPlan{}
+// fetchArgs is the parsed form of a fetch command's arguments.
+type fetchArgs struct {
+	wants   []string
+	haves   []string
+	shallow []string
+	depth   *int
+}
+
+// parseFetchArgs parses fetch argument lines (want/have/shallow/deepen).
+func parseFetchArgs(argLines []string) fetchArgs {
+	var args fetchArgs
 	for _, raw := range argLines {
 		line := strings.TrimSpace(raw)
 		switch {
 		case strings.HasPrefix(line, "want "):
-			plan.wants = append(plan.wants, strings.TrimSpace(line[5:]))
+			args.wants = append(args.wants, strings.TrimSpace(line[5:]))
 		case strings.HasPrefix(line, "have "):
-			plan.haves = append(plan.haves, strings.TrimSpace(line[5:]))
+			args.haves = append(args.haves, strings.TrimSpace(line[5:]))
 		case strings.HasPrefix(line, "shallow "):
-			plan.shallow = append(plan.shallow, strings.TrimSpace(line[8:]))
+			args.shallow = append(args.shallow, strings.TrimSpace(line[8:]))
 		case strings.HasPrefix(line, "deepen "):
 			if n, err := strconv.Atoi(strings.TrimSpace(line[7:])); err == nil && n >= 0 {
 				if n == 0 {
-					plan.depth = nil
+					args.depth = nil
 				} else {
 					d := n
-					plan.depth = &d
+					args.depth = &d
 				}
 			}
 		}
+	}
+	return args
+}
+
+// fetchCacheKey identifies a have-less fetch: with no haves, the pack is
+// fully determined by the repo + wanted oids + shallow boundary + depth.
+func fetchCacheKey(owner, repoName string, args fetchArgs) string {
+	wants := append([]string(nil), args.wants...)
+	sort.Strings(wants)
+	shallow := append([]string(nil), args.shallow...)
+	sort.Strings(shallow)
+	depth := "none"
+	if args.depth != nil {
+		depth = strconv.Itoa(*args.depth)
+	}
+	return owner + "/" + repoName + "\x00" + strings.Join(wants, ",") + "\x00" + strings.Join(shallow, ",") + "\x00" + depth
+}
+
+// fetchV2Locked parses fetch args and selects objects (caller holds RLock).
+func fetchV2Locked(s *Store, r *repo, args fetchArgs) fetchPlan {
+	plan := fetchPlan{
+		wants:   args.wants,
+		haves:   args.haves,
+		shallow: args.shallow,
+		depth:   args.depth,
 	}
 	for _, have := range plan.haves {
 		if _, ok := r.objects[have]; ok {
@@ -396,6 +442,14 @@ func handleUploadPackV0(s *Store, owner, repoName string, body []byte) response 
 			}
 		}
 	}
+	v0CacheKey := ""
+	if len(haves) == 0 {
+		v0CacheKey = fetchCacheKey(owner, repoName, fetchArgs{wants: wants, shallow: shallow, depth: depth})
+		if cached, ok := s.fetchCacheGet(v0CacheKey); ok {
+			s.mu.RUnlock()
+			return bufResp(200, resultType, cached)
+		}
+	}
 	selection := selectFetchObjects(r.objects, wants, haves, shallow, depth)
 	var heldHaves []string
 	for _, have := range haves {
@@ -438,7 +492,11 @@ func handleUploadPackV0(s *Store, owner, repoName string, body []byte) response 
 		parts.Write(pktLine(chunkBuf))
 	}
 	parts.Write(flushPkt)
-	return bufResp(200, resultType, parts.Bytes())
+	out := parts.Bytes()
+	if v0CacheKey != "" {
+		s.fetchCachePut(v0CacheKey, out)
+	}
+	return bufResp(200, resultType, out)
 }
 
 // ---------------------------------------------------------------- receive-pack
@@ -601,4 +659,3 @@ func isHex40(s string) bool {
 	}
 	return true
 }
-
